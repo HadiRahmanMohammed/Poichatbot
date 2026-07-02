@@ -1,0 +1,8 @@
+streamlit>=1.35
+streamlit-folium>=0.20
+folium>=0.16
+requests>=2.31
+pandas>=2.0
+openpyxl>=3.1
+shapely>=2.0
+pyproj>=3.6
