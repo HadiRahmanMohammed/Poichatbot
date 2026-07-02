@@ -1,30 +1,24 @@
 """
-POI Polygon Extractor Chatbot — v1.0
-=====================================
-Interactive Streamlit chatbot that extracts PARENT (lot / site / parcel) and
-CHILD (building footprint) polygons for any property / mall / POI from a
-real-estate or general web link.
-
-Pipeline:
-  1. Scrape the shared link (direct fetch -> Jina AI reader fallback, both free)
-  2. LLM (Google Gemini, free tier) extracts address + listed lot/building size
-  3. Geocode via OpenStreetMap Nominatim (free)
-  4. Fetch polygons via Nominatim polygon_geojson + Overpass API (free)
-     - PARENT  = enclosing land parcel / landuse / site polygon
-     - CHILD   = building footprints inside the parent
-  5. Geodesic area computed with pyproj (m² + sqft + acres)
-  6. Results -> table, CSV/Excel download, append to an existing Excel file
-  7. Folium map with parent (blue) and child (red) polygons
-
-Run:  streamlit run app.py
+POI Polygon Extractor Chatbot — fixed deployable Streamlit version
+-----------------------------------------------------------------
+Paste a property / mall / POI URL, Google Maps URL, lat/lon, or address.
+The app extracts a parent polygon and child building polygons using free services:
+- Jina Reader for page text fallback
+- Gemini API optional for smarter address extraction/chat
+- Nominatim + Photon for geocoding
+- Overpass/OpenStreetMap for polygons
 """
+
+from __future__ import annotations
 
 import io
 import json
 import math
+import os
 import re
 import time
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 
 import folium
 import pandas as pd
@@ -32,38 +26,36 @@ import requests
 import streamlit as st
 from pyproj import Geod
 from shapely.geometry import Point, Polygon, shape
+from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
-# ----------------------------------------------------------------------------
-# Constants & helpers
-# ----------------------------------------------------------------------------
 GEOD = Geod(ellps="WGS84")
-UA = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-AU,en;q=0.9",
-}
+M2_TO_SQFT = 10.7639
+M2_TO_ACRE = 0.000247105
 NOMINATIM = "https://nominatim.openstreetmap.org"
+PHOTON = "https://photon.komoot.io/api/"
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-)
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+APP_EMAIL = os.getenv("CONTACT_EMAIL", "poi-extractor@example.com")
+UA = {"User-Agent": f"POI Polygon Extractor/1.1 ({APP_EMAIL})", "Accept-Language": "en"}
 
-M2_TO_SQFT = 10.7639
-M2_TO_ACRE = 0.000247105
+STREET_WORDS = r"street|st|road|rd|avenue|ave|drive|dr|court|ct|crescent|cres|boulevard|blvd|lane|ln|way|place|pl|terrace|tce|highway|hwy|parade|pde|circuit|cct|esplanade|esp|circle|cir|trail|trl|parkway|pkwy|square|sq"
+AU_STATES = "NSW VIC QLD WA SA TAS ACT NT".split()
+US_STATES = "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC".split()
+PARENT_KEYS = ["landuse", "amenity", "leisure", "shop", "tourism", "boundary", "place", "office"]
 
-PARENT_TAGS = [
-    "landuse", "amenity", "leisure", "shop", "tourism", "boundary", "place",
-]
+
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(name, default) or os.getenv(name, default)
+    except Exception:
+        return os.getenv(name, default)
 
 
 def geodesic_area_m2(geom) -> float:
-    """Geodesic (true earth-surface) area of a shapely polygon, in m²."""
     try:
         area, _ = GEOD.geometry_area_perimeter(geom)
         return abs(area)
@@ -71,342 +63,234 @@ def geodesic_area_m2(geom) -> float:
         return 0.0
 
 
+def geom_to_wkt(geom) -> str:
+    try:
+        return geom.wkt
+    except Exception:
+        return ""
+
+
 def fmt_area(m2: float) -> str:
     return f"{m2:,.1f} m² | {m2 * M2_TO_SQFT:,.0f} sqft | {m2 * M2_TO_ACRE:.3f} ac"
 
 
-# ----------------------------------------------------------------------------
-# 0) Address straight from the URL (no fetching needed — unblockable)
-#    Big portals embed the full address in the URL slug.
-# ----------------------------------------------------------------------------
-STREET_WORDS = (r"street|st|road|rd|avenue|ave|drive|dr|court|ct|crescent|cres|boulevard|blvd|"
-                r"lane|ln|way|place|pl|terrace|tce|highway|hwy|parade|pde|circuit|cct|"
-                r"esplanade|esp|circle|cir|trail|trl|parkway|pkwy|square|sq")
-US_STATES = ("AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT "
-             "NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC").split()
-AU_STATES = "NSW VIC QLD WA SA TAS ACT NT".split()
+def clean_text(html: str) -> str:
+    html = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<style.*?</style>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<[^>]+>", " ", html)
+    return re.sub(r"\s+", " ", html).strip()
 
 
-def address_from_url(url: str) -> str | None:
-    """Parse the address directly out of well-known portal URL patterns."""
-    from urllib.parse import urlparse, unquote
-    u = urlparse(url.lower())
-    host, path = u.netloc, unquote(u.path)
-
-    def tidy(s: str) -> str:
-        s = s.replace("+", " ").replace("_", " ").replace("-", " ")
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    # Zillow: /homedetails/1234-N-Main-St-Phoenix-AZ-85001/12345_zpid/
-    if "zillow." in host:
-        m = re.search(r"/homedetails/([^/]+)/", path)
+def extract_latlon_from_url_or_text(text: str) -> tuple[float, float] | None:
+    s = unquote(text)
+    patterns = [
+        r"@(-?\d+\.\d+),\s*(-?\d+\.\d+)",
+        r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)",
+        r"[?&](?:q|ll|center)=(-?\d+\.\d+),\s*(-?\d+\.\d+)",
+        r"\b(-?\d{1,2}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, s)
         if m:
-            slug = tidy(m.group(1))
-            m2 = re.search(rf"^(.*?)\s({'|'.join(s.lower() for s in US_STATES)})\s(\d{{5}})$", slug)
-            if m2:
-                return f"{m2.group(1)}, {m2.group(2).upper()} {m2.group(3)}, USA"
-            return slug + ", USA"
-
-    # Redfin: /AZ/Phoenix/1234-N-Main-St-85001/home/123456
-    if "redfin." in host:
-        m = re.search(r"/([a-z]{2})/([^/]+)/([^/]+)/home/", path)
-        if m:
-            state, city, street = m.group(1).upper(), tidy(m.group(2)), tidy(m.group(3))
-            street = re.sub(r"\s\d{5}$", "", street)
-            return f"{street}, {city}, {state}, USA"
-
-    # Realtor.com: /realestateandhomes-detail/1234-Main-St_Phoenix_AZ_85001_M123-456
-    if "realtor.com" in host:
-        m = re.search(r"/realestateandhomes-detail/([^/]+)", path)
-        if m:
-            parts = m.group(1).split("_")
-            parts = [p for p in parts if not re.match(r"^m\d", p)]
-            return tidy(", ".join(parts)) + ", USA"
-
-    # Trulia: /p/az/phoenix/1234-n-main-st-phoenix-az-85001--123456
-    if "trulia." in host:
-        m = re.search(r"/p/[a-z]{2}/[^/]+/([^/]+?)(?:--\d+)?/?$", path)
-        if m:
-            return tidy(m.group(1)) + ", USA"
-
-    # Domain.com.au: /12-smith-street-darwin-city-nt-0800-2019001234
-    if "domain.com.au" in host:
-        m = re.search(r"/(\d+[a-z]?(?:-[\w']+)+?-(?:%s)-[\w-]+?-(?:%s)-\d{4})" %
-                      (STREET_WORDS, "|".join(s.lower() for s in AU_STATES)), path)
-        if m:
-            return tidy(m.group(1)) + ", Australia"
-        m = re.search(r"/([\w'+-]+)-(\d{4})-\d{6,}", path)  # suburb-postcode-id
-        if m:
-            return f"{tidy(m.group(1))} {m.group(2)}, Australia"
-
-    # realestate.com.au: /property/12-smith-st-darwin-city-nt-0800/  OR
-    #                    /property-house-nt-darwin+city-141234567
-    if "realestate.com" in host:
-        m = re.search(r"/property/([\w'+-]+?)/?$", path)
-        if m and re.match(r"^\d", m.group(1)):
-            return tidy(m.group(1)) + ", Australia"
-        m = re.search(r"/property-[\w]+-(%s)-([\w'+]+)-\d{6,}" %
-                      "|".join(s.lower() for s in AU_STATES), path)
-        if m:
-            return f"{tidy(m.group(2))}, {m.group(1).upper()}, Australia"
-
-    # Generic: number-street-words-...-(state)-(zip/postcode) anywhere in path
-    m = re.search(rf"(\d+[a-z]?(?:-[\w']+){{1,6}}-(?:{STREET_WORDS})(?:-[\w']+){{0,5}})", path)
-    if m:
-        addr = tidy(m.group(1))
-        tail = re.search(rf"\b({'|'.join(s.lower() for s in US_STATES + AU_STATES)})[-/](\d{{4,5}})\b", path)
-        if tail:
-            addr += f", {tail.group(1).upper()} {tail.group(2)}"
-        return addr
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
     return None
 
 
-# ----------------------------------------------------------------------------
-# 1) Page fetching (direct -> Jina reader -> CORS proxy -> ScraperAPI)
-# ----------------------------------------------------------------------------
+def tidy_slug(s: str) -> str:
+    s = unquote(s).replace("+", " ").replace("_", " ").replace("-", " ")
+    s = re.sub(r"\s+", " ", s).strip(" ,/|")
+    return s
+
+
+def address_from_url(url: str) -> str | None:
+    """Best-effort portal URL address extraction. Some portals only expose suburb+listing id."""
+    u = urlparse(url.lower())
+    host, path = u.netloc, unquote(u.path)
+
+    if "zillow." in host:
+        m = re.search(r"/homedetails/([^/]+)/", path)
+        if m:
+            return tidy_slug(re.sub(r"/.*", "", m.group(1))) + ", USA"
+
+    if "redfin." in host:
+        m = re.search(r"/([a-z]{2})/([^/]+)/([^/]+)/home/", path)
+        if m:
+            street = re.sub(r"\s\d{5}$", "", tidy_slug(m.group(3)))
+            return f"{street}, {tidy_slug(m.group(2))}, {m.group(1).upper()}, USA"
+
+    if "realtor.com" in host:
+        m = re.search(r"/realestateandhomes-detail/([^/]+)", path)
+        if m:
+            return tidy_slug(re.sub(r"_m\d.*$", "", m.group(1)).replace("_", ", ")) + ", USA"
+
+    if "domain.com.au" in host:
+        m = re.search(rf"/(\d+[a-z]?(?:-[\w']+)+?-(?:{STREET_WORDS})-[\w'-]+-(?:{'|'.join(s.lower() for s in AU_STATES)})-\d{{4}})", path)
+        if m:
+            return tidy_slug(m.group(1)) + ", Australia"
+
+    if "realestate.com.au" in host or "realcommercial.com.au" in host:
+        # /property/12-smith-st-darwin-city-nt-0800
+        m = re.search(r"/property/([^/?#]+)", path)
+        if m and re.match(r"^\d", m.group(1)):
+            return tidy_slug(m.group(1)) + ", Australia"
+        # /property-house-nt-darwin+city-142... gives only suburb, useful as fallback but not exact
+        m = re.search(rf"/property-[\w]+-({'|'.join(s.lower() for s in AU_STATES)})-([\w+.-]+)-\d+", path)
+        if m:
+            return f"{tidy_slug(m.group(2))}, {m.group(1).upper()}, Australia"
+
+    m = re.search(rf"(\d+[a-z]?(?:-[\w']+){{1,8}}-(?:{STREET_WORDS})(?:-[\w']+){{0,8}})", path)
+    if m:
+        return tidy_slug(m.group(1))
+    return None
+
+
 def fetch_page_text(url: str, scraper_key: str = "") -> tuple[str, str]:
-    """Return (text, method). Cascades through free fetch strategies."""
-
-    def strip_html(html: str) -> str:
-        t = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
-        t = re.sub(r"<style.*?</style>", " ", t, flags=re.S | re.I)
-        t = re.sub(r"<[^>]+>", " ", t)
-        return re.sub(r"\s+", " ", t)
-
-    # 1. Direct with realistic browser headers
-    try:
-        r = requests.get(url, headers={**UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://www.google.com/", "DNT": "1",
-            "Upgrade-Insecure-Requests": "1"}, timeout=15)
-        if r.status_code == 200 and len(r.text) > 500:
-            txt = strip_html(r.text)
-            if len(txt) > 400 and "captcha" not in txt[:2000].lower():
-                return txt[:18000], "direct"
-    except Exception:
-        pass
-
-    # 2. Jina AI reader (free, renders JS)
-    try:
-        r = requests.get(f"https://r.jina.ai/{url}",
-                         headers={**UA, "X-Return-Format": "text"}, timeout=25)
-        if r.status_code == 200 and len(r.text) > 300 and "captcha" not in r.text[:2000].lower():
-            return r.text[:18000], "jina-reader"
-    except Exception:
-        pass
-
-    # 3. AllOrigins CORS proxy (free)
-    try:
-        r = requests.get("https://api.allorigins.win/raw",
-                         params={"url": url}, headers=UA, timeout=25)
-        if r.status_code == 200 and len(r.text) > 500:
-            txt = strip_html(r.text)
-            if len(txt) > 400:
-                return txt[:18000], "allorigins-proxy"
-    except Exception:
-        pass
-
-    # 4. ScraperAPI (optional user key — free tier 1000 req/mo, handles JS + blocks)
+    methods = []
+    methods.append(("direct", url, {}, 20))
+    methods.append(("jina-reader", f"https://r.jina.ai/http://r.jina.ai/http://example.com".replace("http://r.jina.ai/http://example.com", url), {"X-Return-Format": "text"}, 30))
     if scraper_key:
-        try:
-            r = requests.get("https://api.scraperapi.com/",
-                             params={"api_key": scraper_key, "url": url, "render": "true"},
-                             timeout=60)
-            if r.status_code == 200 and len(r.text) > 500:
-                return strip_html(r.text)[:18000], "scraperapi"
-        except Exception:
-            pass
+        methods.append(("scraperapi", "https://api.scraperapi.com/", {"api_key": scraper_key, "url": url, "render": "true"}, 60))
 
+    for name, endpoint, params, timeout in methods:
+        try:
+            if name == "scraperapi":
+                r = requests.get(endpoint, params=params, headers=UA, timeout=timeout)
+            else:
+                r = requests.get(endpoint, headers=UA | params, timeout=timeout)
+            if r.status_code == 200 and len(r.text) > 300:
+                text = r.text if name == "jina-reader" else clean_text(r.text)
+                if "captcha" not in text[:2500].lower() and len(text) > 250:
+                    return text[:20000], name
+        except Exception:
+            continue
     return "", "failed"
 
 
-# ----------------------------------------------------------------------------
-# 2) LLM extraction (Gemini) + regex fallback
-# ----------------------------------------------------------------------------
 def gemini_call(prompt: str, api_key: str, model: str, temperature: float = 0.1) -> str:
     if not api_key:
         return ""
     try:
-        resp = requests.post(
+        r = requests.post(
             GEMINI_URL.format(model=model),
             params={"key": api_key},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": temperature, "maxOutputTokens": 1024},
+                "generationConfig": {"temperature": temperature, "maxOutputTokens": 1200},
             },
-            timeout=40,
+            timeout=45,
         )
-        data = resp.json()
+        data = r.json()
+        if "error" in data:
+            return ""
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
         return ""
 
 
 def regex_extract(text: str) -> dict:
-    """Cheap fallback extraction when no LLM key is set."""
-    out = {"address": None, "lot_size_m2": None, "building_size_m2": None}
-    # land / lot size
-    m = re.search(r"(?:land|lot)\s*(?:size|area)?[:\s]*([\d,\.]+)\s*(m2|m²|sqm|sq\.?\s*m|acres?|ha|sq\.?\s*ft|sqft)", text, re.I)
+    out = {"address": None, "property_type": None, "lot_size_m2": None, "building_size_m2": None, "listed_price": None, "notes": None}
+    m = re.search(r"(?:land|lot)\s*(?:size|area)?[:\s-]*([\d,.]+)\s*(m2|m²|sqm|sq\.?\s*m|acres?|ha|sq\.?\s*ft|sqft)", text, re.I)
     if m:
-        val = float(m.group(1).replace(",", ""))
-        unit = m.group(2).lower()
-        if "ac" in unit:
-            val /= M2_TO_ACRE
-        elif unit == "ha":
-            val *= 10000
-        elif "ft" in unit:
-            val /= M2_TO_SQFT
+        val = float(m.group(1).replace(",", "")); unit = m.group(2).lower()
+        if "ac" in unit: val /= M2_TO_ACRE
+        elif unit == "ha": val *= 10000
+        elif "ft" in unit: val /= M2_TO_SQFT
         out["lot_size_m2"] = val
-    # address-ish line
-    m = re.search(r"\d{1,5}[A-Za-z]?\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3}\s+(?:St|Street|Rd|Road|Ave|Avenue|Dr|Drive|Ct|Court|Cres|Crescent|Blvd|Boulevard|Ln|Lane|Way|Pl|Place|Tce|Terrace)\b[^,.\n]{0,40}(?:,\s*[^,.\n]{2,40}){0,3}", text)
+    m = re.search(r"\d{1,5}[A-Za-z]?\s+[A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,5}\s+(?:St|Street|Rd|Road|Ave|Avenue|Dr|Drive|Ct|Court|Cres|Crescent|Blvd|Boulevard|Ln|Lane|Way|Pl|Place|Tce|Terrace|Hwy|Highway|Pde|Parade)\b[^\n]{0,80}", text)
     if m:
-        out["address"] = m.group(0).strip()
+        out["address"] = m.group(0).strip(" ,.-")
     return out
 
 
 def llm_extract_listing(text: str, url: str, api_key: str, model: str) -> dict:
-    prompt = f"""You are a real-estate data extractor. From the page text below (source: {url}),
-extract and return ONLY a JSON object (no markdown, no backticks) with keys:
-  "address": FULL geocodable street address as one string — must include suburb/city, state and country; infer the country from the website domain if needed (or null),
-  "property_type": e.g. house, apartment, mall, land, commercial (or null),
-  "lot_size_m2": land/lot size converted to square metres as a number (or null),
-  "building_size_m2": building/floor size in square metres as a number (or null),
-  "listed_price": string or null,
-  "notes": one short sentence of anything relevant to land area.
-Convert acres (x4046.86), hectares (x10000), sqft (/10.7639) to m².
-
-PAGE TEXT:
-{text[:12000]}"""
+    prompt = f"""Extract real-estate/POI listing data from this page. Return ONLY valid JSON with keys:
+address, property_type, lot_size_m2, building_size_m2, listed_price, notes.
+Address must be full and geocodable, including suburb/city, state and country.
+Convert acres to m2 by 4046.86, hectares by 10000, sqft by /10.7639. Use null when unknown.
+URL: {url}
+TEXT:\n{text[:13000]}"""
     raw = gemini_call(prompt, api_key, model)
     if raw:
         raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, flags=re.S)
         try:
-            return json.loads(raw)
+            return json.loads(m.group(0) if m else raw)
         except Exception:
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except Exception:
-                    pass
+            pass
     return regex_extract(text)
 
 
-# ----------------------------------------------------------------------------
-# 3) Geocoding (Nominatim, returns polygon when available)
-# ----------------------------------------------------------------------------
-def clean_address(addr: str) -> str:
-    """Strip listing noise Nominatim chokes on: units, lots, prices, marketing text."""
-    a = addr.strip()
-    a = re.sub(r"(?i)\b(?:unit|apt|apartment|suite|shop|level)\s*\d+\w?\s*[,/]?\s*", "", a)
-    a = re.sub(r"(?i)\blot\s*\d+\w?\s*[,/]?\s*", "", a)
-    a = re.sub(r"^\d+\w?/(\d)", r"\1", a)          # "2/45 Smith St" -> "45 Smith St"
-    a = re.sub(r"(?i)\$[\d,\.]+[km]?", "", a)       # prices
-    a = re.sub(r"(?i)\b(for sale|for rent|sold|auction|offers?)\b.*", "", a)
-    a = re.sub(r"\s+", " ", a).strip(" ,-|·")
-    return a
+def clean_address(a: str) -> str:
+    a = re.sub(r"(?i)\b(for sale|sold|auction|offers?|real estate|property)\b.*", "", a)
+    a = re.sub(r"(?i)^\s*(unit|apt|apartment|suite|shop|level)\s*\w+\s*[/,-]?\s*", "", a)
+    a = re.sub(r"^\s*\w+/(\d+)", r"\1", a)
+    return re.sub(r"\s+", " ", a).strip(" ,-|·")
 
 
-def _nominatim(q: str) -> dict | None:
+def nominatim_search(q: str) -> dict | None:
     try:
-        r = requests.get(
-            f"{NOMINATIM}/search",
-            params={"q": q, "format": "json", "limit": 1,
-                    "polygon_geojson": 1, "addressdetails": 1},
-            headers=UA, timeout=20,
-        )
-        res = r.json()
-        if res:
-            return res[0]
+        r = requests.get(f"{NOMINATIM}/search", params={"q": q, "format": "json", "limit": 1, "polygon_geojson": 1, "addressdetails": 1}, headers=UA, timeout=25)
+        if r.status_code == 200:
+            data = r.json()
+            return data[0] if data else None
     except Exception:
-        pass
+        return None
     return None
 
 
-def _photon(q: str) -> dict | None:
-    """Free komoot Photon geocoder — much more forgiving than Nominatim."""
+def photon_search(q: str) -> dict | None:
     try:
-        r = requests.get("https://photon.komoot.io/api/",
-                         params={"q": q, "limit": 1}, headers=UA, timeout=20)
+        r = requests.get(PHOTON, params={"q": q, "limit": 1}, headers=UA, timeout=25)
         feats = r.json().get("features", [])
         if feats:
-            f = feats[0]
-            lon, lat = f["geometry"]["coordinates"]
-            props = f.get("properties", {})
-            label = ", ".join(str(props[k]) for k in
-                              ("name", "street", "housenumber", "city", "state", "country")
-                              if props.get(k))
+            f = feats[0]; lon, lat = f["geometry"]["coordinates"]; props = f.get("properties", {})
+            label = ", ".join(str(props[k]) for k in ["name", "street", "housenumber", "city", "state", "country"] if props.get(k))
             return {"lat": lat, "lon": lon, "display_name": label or q, "geojson": None}
     except Exception:
-        pass
+        return None
     return None
 
 
-def geocode(query: str, api_key: str = "", model: str = "gemini-2.0-flash",
-            log: list | None = None) -> dict | None:
-    """Multi-strategy geocoding cascade. Logs every attempt if a log list is given."""
-    def _log(msg):
-        if log is not None:
-            log.append(msg)
-
-    candidates = [query]
-    cleaned = clean_address(query)
-    if cleaned and cleaned != query:
-        candidates.append(cleaned)
-    # street + locality only (drop leading descriptors)
-    m = re.search(r"\d+\w?\s+[\w' \-]+?(?:St|Street|Rd|Road|Ave|Avenue|Dr|Drive|Ct|Court|"
-                  r"Cres|Crescent|Blvd|Boulevard|Ln|Lane|Way|Pl|Place|Tce|Terrace|Hwy|Highway|"
-                  r"Pde|Parade|Cct|Circuit|Esp|Esplanade)\b.*", cleaned or query, re.I)
-    if m:
-        candidates.append(m.group(0))
-    # locality-level last resort: last 2-3 comma parts
-    parts = [p.strip() for p in (cleaned or query).split(",") if p.strip()]
+def geocode(q: str, api_key: str, model: str, log: list[str]) -> dict | None:
+    candidates = [q, clean_address(q)]
+    parts = [p.strip() for p in clean_address(q).split(",") if p.strip()]
     if len(parts) >= 2:
         candidates.append(", ".join(parts[-3:]))
-
     seen = set()
     for cand in candidates:
         if not cand or cand.lower() in seen:
             continue
         seen.add(cand.lower())
-        _log(f"Geocode try (Nominatim): '{cand}'")
-        res = _nominatim(cand)
+        log.append(f"Geocoding: {cand}")
+        res = nominatim_search(cand)
         if res:
-            _log("  ↳ ✅ hit")
             return res
-        time.sleep(1.1)  # Nominatim rate policy
-        _log(f"Geocode try (Photon): '{cand}'")
-        res = _photon(cand)
+        time.sleep(1.05)
+        res = photon_search(cand)
         if res:
-            _log("  ↳ ✅ hit (Photon)")
             return res
-
-    # Final resort: ask the LLM to normalise the address, retry both geocoders
     if api_key:
-        norm = gemini_call(
-            f"Reformat this into a clean geocodable address in the form "
-            f"'house_number street, suburb, state, country' — output ONLY the address, "
-            f"nothing else. If a country is missing, infer it: '{query}'",
-            api_key, model,
-        ).strip()
-        if norm and norm.lower() not in seen and len(norm) < 140:
-            _log(f"Geocode try (LLM-normalised): '{norm}'")
-            res = _nominatim(norm) or _photon(norm)
-            if res:
-                _log("  ↳ ✅ hit")
-                return res
-    _log("  ↳ ❌ all geocoding strategies failed")
+        norm = gemini_call(f"Clean this into one geocodable address only: {q}", api_key, model).strip()
+        if norm and norm.lower() not in seen:
+            log.append(f"Geocoding LLM-normalised: {norm}")
+            return nominatim_search(norm) or photon_search(norm)
     return None
 
 
-# ----------------------------------------------------------------------------
-# 4) Overpass polygons
-# ----------------------------------------------------------------------------
-def overpass(query: str) -> dict:
-    for ep in OVERPASS_ENDPOINTS:
+def reverse_geocode(lat: float, lon: float) -> str:
+    try:
+        r = requests.get(f"{NOMINATIM}/reverse", params={"lat": lat, "lon": lon, "format": "json", "zoom": 18, "addressdetails": 1}, headers=UA, timeout=20)
+        return r.json().get("display_name", f"{lat}, {lon}")
+    except Exception:
+        return f"{lat}, {lon}"
+
+
+def overpass_query(q: str) -> dict:
+    for endpoint in OVERPASS_ENDPOINTS:
         try:
-            r = requests.post(ep, data={"data": query}, headers=UA, timeout=45)
+            r = requests.post(endpoint, data={"data": q}, headers=UA, timeout=60)
             if r.status_code == 200:
                 return r.json()
         except Exception:
@@ -414,535 +298,287 @@ def overpass(query: str) -> dict:
     return {"elements": []}
 
 
-def way_to_polygon(el, nodes: dict) -> Polygon | None:
-    if el.get("type") != "way":
-        return None
-    coords = []
-    if "geometry" in el:
-        coords = [(g["lon"], g["lat"]) for g in el["geometry"]]
-    else:
-        coords = [(nodes[n][1], nodes[n][0]) for n in el.get("nodes", []) if n in nodes]
-    if len(coords) >= 4 and coords[0] == coords[-1]:
-        try:
-            p = Polygon(coords)
-            if p.is_valid and p.area > 0:
-                return p
-        except Exception:
-            pass
+def coords_to_poly(coords) -> Polygon | None:
+    if len(coords) >= 4:
+        if coords[0] != coords[-1]:
+            coords = coords + [coords[0]]
+        p = Polygon(coords)
+        if p.is_valid and p.area > 0:
+            return p
     return None
 
 
-def fetch_osm_polygons(lat: float, lon: float, radius: int = 120) -> dict:
-    """Returns {'parent': [(polygon, tags)], 'children': [(polygon, tags)]}."""
+def fetch_osm_polygons(lat: float, lon: float, radius: int) -> dict:
     q = f"""
-    [out:json][timeout:40];
+    [out:json][timeout:50];
     (
       way(around:{radius},{lat},{lon})["building"];
+      relation(around:{radius},{lat},{lon})["building"];
       way(around:{radius},{lat},{lon})["landuse"];
       way(around:{radius},{lat},{lon})["amenity"];
       way(around:{radius},{lat},{lon})["leisure"];
-      way(around:{radius},{lat},{lon})["shop"]["building"!~".*"];
-      relation(around:{radius},{lat},{lon})["building"];
+      way(around:{radius},{lat},{lon})["shop"];
+      way(around:{radius},{lat},{lon})["tourism"];
+      relation(around:{radius},{lat},{lon})["landuse"];
+      relation(around:{radius},{lat},{lon})["amenity"];
+      relation(around:{radius},{lat},{lon})["shop"];
     );
     out geom tags;
     """
-    data = overpass(q)
+    data = overpass_query(q)
     pt = Point(lon, lat)
     parents, children = [], []
+
     for el in data.get("elements", []):
         tags = el.get("tags", {})
         poly = None
-        if el["type"] == "way":
-            poly = way_to_polygon(el, {})
-        elif el["type"] == "relation" and "members" in el:
-            outers = [m for m in el["members"] if m.get("role") == "outer" and "geometry" in m]
-            if outers:
-                try:
-                    coords = [(g["lon"], g["lat"]) for g in outers[0]["geometry"]]
-                    if len(coords) >= 4:
-                        poly = Polygon(coords)
-                except Exception:
-                    poly = None
+        if el.get("type") == "way" and el.get("geometry"):
+            poly = coords_to_poly([(g["lon"], g["lat"]) for g in el["geometry"]])
+        elif el.get("type") == "relation" and el.get("members"):
+            rings = []
+            for mem in el["members"]:
+                if mem.get("role") in ("outer", "") and mem.get("geometry"):
+                    p = coords_to_poly([(g["lon"], g["lat"]) for g in mem["geometry"]])
+                    if p:
+                        rings.append(p)
+            if rings:
+                poly = unary_union(rings)
+                if poly.geom_type == "MultiPolygon":
+                    poly = max(poly.geoms, key=lambda g: g.area)
         if poly is None or not poly.is_valid:
             continue
         if "building" in tags:
             children.append((poly, tags))
-        elif any(k in tags for k in PARENT_TAGS):
-            if poly.contains(pt) or poly.distance(pt) < 0.0005:
-                parents.append((poly, tags))
+        elif any(k in tags for k in PARENT_KEYS) and (poly.contains(pt) or poly.distance(pt) < 0.0008):
+            parents.append((poly, tags))
     return {"parents": parents, "children": children}
 
 
-# ----------------------------------------------------------------------------
-# 5) Full pipeline for one URL / address
-# ----------------------------------------------------------------------------
-def run_pipeline(query: str, api_key: str, model: str, radius: int, progress, scraper_key: str = "") -> dict:
-    result = {
-        "source": query, "address": None, "lat": None, "lon": None,
-        "listing": {}, "rows": [], "geojson_parent": [], "geojson_children": [],
-        "log": [], "fallback_used": False,
-    }
-    is_url = query.lower().startswith("http")
+def synthetic_parent(lat: float, lon: float, lot_size_m2: float | None, radius: int) -> tuple[Polygon, dict]:
+    side = math.sqrt(float(lot_size_m2 or (radius * radius)))
+    d_lat = side / 2 / 111_320
+    d_lon = side / 2 / (111_320 * max(math.cos(math.radians(lat)), 0.2))
+    poly = Polygon([(lon-d_lon, lat-d_lat), (lon+d_lon, lat-d_lat), (lon+d_lon, lat+d_lat), (lon-d_lon, lat+d_lat), (lon-d_lon, lat-d_lat)])
+    return poly, {"source": "approximate square from listed lot size/search radius"}
+
+
+def run_pipeline(user_query: str, api_key: str, model: str, radius: int, progress, scraper_key: str = "") -> dict:
+    res = {"source": user_query, "address": None, "lat": None, "lon": None, "listing": {}, "rows": [], "geojson_parent": [], "geojson_children": [], "log": [], "fallback_used": False}
+    coords = extract_latlon_from_url_or_text(user_query)
     listing = {}
 
-    if is_url:
-        # 0) Address straight from the URL — instant, cannot be blocked
-        url_addr = address_from_url(query)
+    if user_query.lower().startswith("http"):
+        url_addr = address_from_url(user_query)
         if url_addr:
             listing["address"] = url_addr
-            result["log"].append(f"Address parsed from URL slug: '{url_addr}' (no scraping needed)")
-
-        # 1) Fetch page for enrichment (lot size, price…) — optional if we have the address
-        progress.write("🌐 Fetching page…")
-        text, method = fetch_page_text(query, scraper_key)
-        result["log"].append(f"Page fetch: {method}")
+            res["log"].append(f"Address parsed from URL: {url_addr}")
+        progress.write("Reading page text / fallback reader…")
+        text, method = fetch_page_text(user_query, scraper_key)
+        res["log"].append(f"Page fetch method: {method}")
         if text:
-            progress.write(f"🤖 Extracting listing data ({'Gemini' if api_key else 'regex'})…")
-            extracted = llm_extract_listing(text, query, api_key, model)
-            # keep URL-parsed address unless page gives a more complete one
-            if url_addr and (not extracted.get("address") or len(str(extracted.get("address"))) < len(url_addr)):
-                extracted["address"] = url_addr
-            listing = {**listing, **{k: v for k, v in extracted.items() if v}}
-        elif url_addr:
-            result["log"].append("Page blocked — proceeding with URL-parsed address + OSM polygons (cross-reference mode).")
-            result["fallback_used"] = True
-        # Cross-reference fallback: derive a search query from the URL slug
-        if not listing.get("address"):
-            slug = re.sub(r"https?://[^/]+/", "", query)
-            slug = re.sub(r"[-_/]+", " ", slug)
-            slug = re.sub(r"\b(property|listing|details|for sale|html?|www|com|au)\b", " ", slug, flags=re.I)
-            slug = re.sub(r"\d{6,}", " ", slug)
-            slug = re.sub(r"\s+", " ", slug).strip()
-            if api_key and slug:
-                guess = gemini_call(
-                    f"This URL slug came from a real-estate listing: '{slug}'. "
-                    f"Return ONLY the most likely full street address (one line, no extra words).",
-                    api_key, model,
-                )
-                if guess and len(guess) < 120:
-                    listing["address"] = guess.strip()
-                    result["fallback_used"] = True
-                    result["log"].append("Address recovered from URL slug via LLM (cross-reference mode).")
-            elif slug:
-                listing["address"] = slug
-                result["fallback_used"] = True
+            extracted = llm_extract_listing(text, user_query, api_key, model)
+            if listing.get("address") and not extracted.get("address"):
+                extracted["address"] = listing["address"]
+            listing.update({k: v for k, v in extracted.items() if v not in (None, "")})
+        elif coords:
+            res["log"].append("Page blocked, but coordinates were found in the URL.")
+            res["fallback_used"] = True
     else:
-        listing = {"address": query}
+        listing["address"] = user_query
 
-    result["listing"] = listing
-    addr = listing.get("address")
-    if not addr:
-        result["log"].append("❌ Could not determine an address from this link.")
-        return result
+    if coords:
+        lat, lon = coords
+        address = reverse_geocode(lat, lon)
+        res.update(lat=lat, lon=lon, address=address)
+        if not listing.get("address"):
+            listing["address"] = address
+    else:
+        addr = listing.get("address")
+        if not addr:
+            res["log"].append("Could not find an address or coordinates. Paste the address directly for blocked listings.")
+            return res
+        progress.write(f"Geocoding: {addr}")
+        geo = geocode(addr, api_key, model, res["log"])
+        if not geo:
+            res["log"].append("Geocoding failed. Try a full address with suburb/state/country.")
+            return res
+        res.update(lat=float(geo["lat"]), lon=float(geo["lon"]), address=geo.get("display_name", addr))
+        if geo.get("geojson"):
+            try:
+                g = shape(geo["geojson"])
+                if g.geom_type == "MultiPolygon":
+                    g = max(g.geoms, key=lambda p: p.area)
+                listing["_nominatim_parent"] = g
+            except Exception:
+                pass
 
-    result["log"].append(f"Address extracted: '{addr}'")
-    progress.write(f"📍 Geocoding: {addr}")
-    geo = geocode(addr, api_key, model, log=result["log"])
-    if not geo:
-        result["log"].append("❌ Geocoding failed on all strategies.")
-        return result
+    res["listing"] = listing
+    progress.write("Fetching OSM parent/child polygons…")
+    osm = fetch_osm_polygons(res["lat"], res["lon"], radius)
 
-    lat, lon = float(geo["lat"]), float(geo["lon"])
-    result.update(lat=lat, lon=lon, address=geo.get("display_name", addr))
-
-    # Parent candidate #1: Nominatim's own polygon for the address
-    nominatim_parent = None
-    gj = geo.get("geojson")
-    if gj and gj.get("type") in ("Polygon", "MultiPolygon"):
-        try:
-            g = shape(gj)
-            if g.geom_type == "MultiPolygon":
-                g = max(g.geoms, key=lambda p: p.area)
-            nominatim_parent = g
-        except Exception:
-            pass
-
-    progress.write("🗺️ Querying OpenStreetMap polygons (Overpass)…")
-    osm = fetch_osm_polygons(lat, lon, radius)
-
-    # Choose parent: prefer landuse/site polygon containing point, else Nominatim polygon
     parent_poly, parent_tags = None, {}
     if osm["parents"]:
-        parent_poly, parent_tags = max(osm["parents"], key=lambda pt_: geodesic_area_m2(pt_[0]))
-    if parent_poly is None and nominatim_parent is not None:
-        parent_poly, parent_tags = nominatim_parent, {"source": "nominatim"}
-    if parent_poly is None and listing.get("lot_size_m2"):
-        # Synthesize a square parent from the listed lot size (approximation)
-        side = math.sqrt(float(listing["lot_size_m2"]))
-        d = side / 2 / 111320
-        parent_poly = Polygon([
-            (lon - d, lat - d), (lon + d, lat - d),
-            (lon + d, lat + d), (lon - d, lat + d), (lon - d, lat - d),
-        ])
-        parent_tags = {"source": "listed lot size (synthesized square)"}
-        result["fallback_used"] = True
+        # avoid accidentally selecting suburb-scale polygons when a smaller parent exists
+        osm_parents = sorted(osm["parents"], key=lambda x: geodesic_area_m2(x[0]))
+        sensible = [p for p in osm_parents if geodesic_area_m2(p[0]) <= 2_000_000]
+        parent_poly, parent_tags = (sensible[0] if sensible else osm_parents[0])
+    elif listing.get("_nominatim_parent") is not None:
+        parent_poly, parent_tags = listing["_nominatim_parent"], {"source": "Nominatim polygon"}
+    else:
+        parent_poly, parent_tags = synthetic_parent(res["lat"], res["lon"], listing.get("lot_size_m2"), radius)
+        res["fallback_used"] = True
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if parent_poly is not None:
-        a = geodesic_area_m2(parent_poly)
-        result["geojson_parent"].append(json.loads(json.dumps(parent_poly.__geo_interface__)))
-        result["rows"].append({
-            "timestamp": ts, "polygon_type": "PARENT",
-            "name": parent_tags.get("name", parent_tags.get("landuse", parent_tags.get("source", "site/lot"))),
-            "area_m2": round(a, 1), "area_sqft": round(a * M2_TO_SQFT, 0),
-            "area_acres": round(a * M2_TO_ACRE, 4),
-            "address": result["address"], "lat": lat, "lon": lon,
-            "osm_tags": json.dumps(parent_tags)[:200], "source_url": query,
-            "listed_lot_m2": listing.get("lot_size_m2"),
-        })
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    parent_area = geodesic_area_m2(parent_poly)
+    res["geojson_parent"].append(json.loads(json.dumps(parent_poly.__geo_interface__)))
+    res["rows"].append({
+        "timestamp": timestamp, "polygon_type": "PARENT", "name": parent_tags.get("name", parent_tags.get("source", parent_tags.get("landuse", "site/lot"))),
+        "area_m2": round(parent_area, 1), "area_sqft": round(parent_area*M2_TO_SQFT, 0), "area_acres": round(parent_area*M2_TO_ACRE, 4),
+        "address": res["address"], "lat": res["lat"], "lon": res["lon"], "source_url": user_query,
+        "listed_lot_m2": listing.get("lot_size_m2"), "osm_tags": json.dumps(parent_tags)[:300], "geometry_wkt": geom_to_wkt(parent_poly),
+    })
 
-    # Children: buildings intersecting the parent (or within radius if no parent)
-    kept = 0
+    child_count = 0
     for poly, tags in osm["children"]:
-        if parent_poly is not None and not poly.intersects(parent_poly.buffer(0.0002)):
+        if not poly.intersects(parent_poly.buffer(0.00025)):
             continue
-        a = geodesic_area_m2(poly)
-        if a < 4:
+        area = geodesic_area_m2(poly)
+        if area < 8:
             continue
-        result["geojson_children"].append(json.loads(json.dumps(poly.__geo_interface__)))
-        result["rows"].append({
-            "timestamp": ts, "polygon_type": "CHILD",
-            "name": tags.get("name", tags.get("building", "building")),
-            "area_m2": round(a, 1), "area_sqft": round(a * M2_TO_SQFT, 0),
-            "area_acres": round(a * M2_TO_ACRE, 4),
-            "address": result["address"], "lat": lat, "lon": lon,
-            "osm_tags": json.dumps(tags)[:200], "source_url": query,
-            "listed_lot_m2": None,
+        child_count += 1
+        res["geojson_children"].append(json.loads(json.dumps(poly.__geo_interface__)))
+        res["rows"].append({
+            "timestamp": timestamp, "polygon_type": "CHILD", "name": tags.get("name", tags.get("building", f"building_{child_count}")),
+            "area_m2": round(area, 1), "area_sqft": round(area*M2_TO_SQFT, 0), "area_acres": round(area*M2_TO_ACRE, 4),
+            "address": res["address"], "lat": res["lat"], "lon": res["lon"], "source_url": user_query,
+            "listed_lot_m2": None, "osm_tags": json.dumps(tags)[:300], "geometry_wkt": geom_to_wkt(poly),
         })
-        kept += 1
-
-    result["log"].append(f"✅ Parent: {'found' if parent_poly is not None else 'NOT found'} | Children: {kept}")
-    return result
+    res["log"].append(f"Parent found: yes | Child buildings found: {child_count}")
+    return res
 
 
-# ----------------------------------------------------------------------------
-# 6) Map builder
-# ----------------------------------------------------------------------------
 def build_map(res: dict) -> folium.Map:
-    m = folium.Map(location=[res["lat"], res["lon"]], zoom_start=18, tiles=None)
+    m = folium.Map(location=[res["lat"], res["lon"]], zoom_start=18, tiles="OpenStreetMap")
     folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
-    folium.TileLayer("OpenStreetMap", name="Street").add_to(m)
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery", name="Satellite",
-    ).add_to(m)
+    folium.TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", attr="Esri World Imagery", name="Satellite").add_to(m)
     for gj in res["geojson_parent"]:
-        folium.GeoJson(
-            gj, name="Parent polygon",
-            style_function=lambda x: {"color": "#4A9EFF", "weight": 3, "dashArray": "7 5",
-                                      "fillColor": "#4A9EFF", "fillOpacity": 0.08},
-            tooltip="PARENT · lot / site",
-        ).add_to(m)
-    for gj in res["geojson_children"]:
-        folium.GeoJson(
-            gj, name="Child polygon",
-            style_function=lambda x: {"color": "#FF5D5D", "weight": 2,
-                                      "fillColor": "#FF5D5D", "fillOpacity": 0.30},
-            tooltip="CHILD · building",
-        ).add_to(m)
+        folium.GeoJson(gj, name="Parent polygon", style_function=lambda _: {"color":"#4A9EFF", "weight":3, "dashArray":"6 5", "fillColor":"#4A9EFF", "fillOpacity":0.08}, tooltip="PARENT").add_to(m)
+    for i, gj in enumerate(res["geojson_children"], 1):
+        folium.GeoJson(gj, name=f"Child {i}", style_function=lambda _: {"color":"#FF5D5D", "weight":2, "fillColor":"#FF5D5D", "fillOpacity":0.32}, tooltip=f"CHILD {i}").add_to(m)
     folium.Marker([res["lat"], res["lon"]], tooltip=res["address"]).add_to(m)
     folium.LayerControl().add_to(m)
     return m
 
 
-# ----------------------------------------------------------------------------
-# 7) Excel helpers
-# ----------------------------------------------------------------------------
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="POI_Polygons")
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="POI_Polygons")
     return buf.getvalue()
 
 
 def append_to_existing_excel(upload, df_new: pd.DataFrame) -> bytes:
     try:
         old = pd.read_excel(upload)
-        combined = pd.concat([old, df_new], ignore_index=True)
+        out = pd.concat([old, df_new], ignore_index=True)
     except Exception:
-        combined = df_new
-    return df_to_excel_bytes(combined)
+        out = df_new
+    return df_to_excel_bytes(out)
 
 
-# ----------------------------------------------------------------------------
-# 8) Streamlit UI
-# ----------------------------------------------------------------------------
 st.set_page_config(page_title="POI Polygon Extractor", page_icon="🗺️", layout="wide")
-
-# ---------------------------------------------------------------------------
-# Design system — "Night Cartography"
-#   ink navy canvas · survey-grid texture · UI accents = polygon legend colors
-#   PARENT #4A9EFF (blue) · CHILD #FF5D5D (coral) · Space Grotesk + JetBrains Mono
-# ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
-
-:root{
-  --ink:#0B1220; --panel:#131C2E; --panel-2:#182338; --line:#233450;
-  --text:#E8EDF5; --muted:#8B97AB;
-  --parent:#4A9EFF; --child:#FF5D5D; --ok:#3DDC97; --warn:#FFB454;
-}
-
-html, body, [class*="css"], .stApp { font-family:'Space Grotesk',sans-serif; }
-.stApp { background:
-  linear-gradient(rgba(74,158,255,0.035) 1px, transparent 1px),
-  linear-gradient(90deg, rgba(74,158,255,0.035) 1px, transparent 1px),
-  var(--ink);
-  background-size: 42px 42px, 42px 42px, auto; }
-
-/* ---------- hero ---------- */
-.hero{ position:relative; overflow:hidden; border:1px solid var(--line);
-  border-radius:16px; padding:26px 30px 22px;
-  background:linear-gradient(135deg,#0E1A30 0%,#101C33 55%,#13233E 100%); }
-.hero::after{ content:""; position:absolute; inset:0; pointer-events:none;
-  background-image:
-    linear-gradient(rgba(74,158,255,.07) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(74,158,255,.07) 1px,transparent 1px);
-  background-size:34px 34px; }
-.hero h1{ margin:0; font-size:1.75rem; font-weight:700; letter-spacing:.3px; color:var(--text); }
-.hero h1 .mode{ font-family:'JetBrains Mono',monospace; font-size:.5em; color:var(--parent);
-  border:1px solid var(--parent); border-radius:6px; padding:2px 8px; vertical-align:middle;
-  margin-left:10px; letter-spacing:1px; }
-.hero p{ margin:8px 0 0; color:var(--muted); max-width:720px; }
-.hero .coords{ position:absolute; top:14px; right:20px; font-family:'JetBrains Mono',monospace;
-  font-size:.68rem; color:var(--muted); letter-spacing:1px; opacity:.8; }
-.hero svg{ position:absolute; right:26px; bottom:-6px; opacity:.9; }
-.legend{ display:flex; gap:18px; margin-top:14px; font-family:'JetBrains Mono',monospace; font-size:.72rem; }
-.legend span{ display:inline-flex; align-items:center; gap:7px; color:var(--muted); letter-spacing:.5px;}
-.swatch{ width:12px; height:12px; border-radius:3px; display:inline-block; }
-.swatch.p{ background:rgba(74,158,255,.25); border:2px solid var(--parent); }
-.swatch.c{ background:rgba(255,93,93,.35); border:2px solid var(--child); }
-
-/* ---------- chat ---------- */
-[data-testid="stChatMessage"]{ background:var(--panel); border:1px solid var(--line);
-  border-radius:14px; padding:14px 16px; }
-[data-testid="stChatMessage"]:has([aria-label="Chat message from user"]),
-[data-testid="stChatMessage"][data-testid*="user"]{ background:var(--panel-2); }
-[data-testid="stChatInput"] textarea{ font-family:'Space Grotesk',sans-serif !important; }
-[data-testid="stChatInput"]{ border:1px solid var(--line); border-radius:14px; }
-[data-testid="stChatInput"]:focus-within{ border-color:var(--parent);
-  box-shadow:0 0 0 3px rgba(74,158,255,.18); }
-
-/* ---------- sidebar ---------- */
-[data-testid="stSidebar"]{ background:linear-gradient(180deg,#0D1626,#0B1220);
-  border-right:1px solid var(--line); }
-[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{
-  font-size:.8rem; text-transform:uppercase; letter-spacing:2px; color:var(--muted);
-  font-family:'JetBrains Mono',monospace; }
-
-/* ---------- tabs ---------- */
-.stTabs [data-baseweb="tab-list"]{ gap:6px; border-bottom:1px solid var(--line); }
-.stTabs [data-baseweb="tab"]{ font-family:'JetBrains Mono',monospace; font-size:.8rem;
-  letter-spacing:1px; border-radius:10px 10px 0 0; padding:8px 18px; color:var(--muted); }
-.stTabs [aria-selected="true"]{ color:var(--parent) !important;
-  background:rgba(74,158,255,.08); border-bottom:2px solid var(--parent); }
-
-/* ---------- metrics as legend cards ---------- */
-[data-testid="stMetric"]{ background:var(--panel); border:1px solid var(--line);
-  border-radius:14px; padding:14px 18px; }
-[data-testid="stMetric"] [data-testid="stMetricLabel"]{ font-family:'JetBrains Mono',monospace;
-  font-size:.68rem; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted); }
-[data-testid="stMetric"] [data-testid="stMetricValue"]{ font-family:'JetBrains Mono',monospace; }
-div[data-testid="column"]:nth-of-type(2) [data-testid="stMetricValue"]{ color:var(--parent); }
-div[data-testid="column"]:nth-of-type(3) [data-testid="stMetricValue"]{ color:var(--child); }
-
-/* ---------- buttons ---------- */
-.stDownloadButton button, .stButton button{
-  border:1px solid var(--line); border-radius:12px; background:var(--panel-2);
-  color:var(--text); font-family:'JetBrains Mono',monospace; font-size:.78rem;
-  letter-spacing:.5px; transition:all .15s ease; }
-.stDownloadButton button:hover, .stButton button:hover{
-  border-color:var(--parent); color:var(--parent);
-  box-shadow:0 0 0 3px rgba(74,158,255,.15); transform:translateY(-1px); }
-
-/* ---------- dataframe / status / misc ---------- */
-[data-testid="stDataFrame"]{ border:1px solid var(--line); border-radius:14px; overflow:hidden; }
-[data-testid="stStatus"]{ background:var(--panel); border:1px solid var(--line); border-radius:14px; }
-[data-testid="stFileUploader"]{ border:1px dashed var(--line); border-radius:14px; padding:6px; }
-hr{ border-color:var(--line) !important; }
-code, .mono{ font-family:'JetBrains Mono',monospace; }
-::-webkit-scrollbar{ width:9px; height:9px; }
-::-webkit-scrollbar-thumb{ background:var(--line); border-radius:6px; }
-::-webkit-scrollbar-thumb:hover{ background:var(--parent); }
-@media (prefers-reduced-motion: reduce){ *{ transition:none !important; animation:none !important; } }
+.stApp {background:#0B1220;color:#E8EDF5;} 
+.hero{border:1px solid #233450;border-radius:16px;padding:24px;background:linear-gradient(135deg,#0E1A30,#13233E);margin-bottom:18px;}
+.hero h1{margin:0;font-size:1.8rem}.hero p{color:#9AA8BD}.tag{font-size:.75rem;border:1px solid #4A9EFF;color:#4A9EFF;border-radius:6px;padding:2px 8px;}
 </style>
+<div class="hero"><h1>🗺️ POI Polygon Extractor <span class="tag">EXPERT MODE</span></h1>
+<p>Paste a property, mall, POI, Google Maps link, lat/lon, or plain address. The app finds parent/site polygons and child building footprints, measures areas, maps them, and exports Excel.</p></div>
 """, unsafe_allow_html=True)
 
-st.markdown(
-    """
-    <div class="hero">
-      <div class="coords">LAT −12.4634 · LON 130.8456 · WGS84</div>
-      <h1>🗺️ POI Polygon Extractor <span class="mode">EXPERT&nbsp;MODE</span></h1>
-      <p>Paste a real-estate / mall / POI link — I'll trace the site boundary and every building
-         footprint inside it, measure true geodesic areas, and export to Excel.</p>
-      <div class="legend">
-        <span><i class="swatch p"></i>PARENT · LOT / SITE</span>
-        <span><i class="swatch c"></i>CHILD · BUILDING</span>
-      </div>
-      <svg width="150" height="86" viewBox="0 0 150 86" fill="none">
-        <polygon points="8,78 22,14 118,6 142,60 96,82" stroke="#4A9EFF" stroke-width="2"
-                 stroke-dasharray="7 5" fill="rgba(74,158,255,0.07)"/>
-        <polygon points="46,50 58,26 100,24 108,52 78,62" stroke="#FF5D5D" stroke-width="2"
-                 fill="rgba(255,93,93,0.16)"/>
-        <circle cx="22" cy="14" r="3.5" fill="#4A9EFF"/><circle cx="142" cy="60" r="3.5" fill="#4A9EFF"/>
-        <circle cx="8" cy="78" r="3.5" fill="#4A9EFF"/><circle cx="118" cy="6" r="3.5" fill="#4A9EFF"/>
-        <circle cx="96" cy="82" r="3.5" fill="#4A9EFF"/>
-      </svg>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---- Sidebar
 with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = st.text_input("Gemini API key (free — aistudio.google.com)", type="password")
-    scraper_key = st.text_input("ScraperAPI key (optional — scraperapi.com free tier)", type="password",
-                                help="Only needed if a portal blocks all free fetch methods. 1,000 free requests/month.")
+    st.header("Settings")
+    default_key = get_secret("GEMINI_API_KEY", "")
+    default_scraper = get_secret("SCRAPERAPI_KEY", "")
+    api_key = st.text_input("Gemini API key", value=default_key, type="password", help="Optional, but improves extraction from messy pages.")
+    scraper_key = st.text_input("ScraperAPI key", value=default_scraper, type="password", help="Optional fallback for blocked pages.")
     model = st.selectbox("Gemini model", ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"])
-    radius = st.slider("Search radius around POI (m)", 40, 500, 120, 20)
-    st.caption("No key? The app still works — it falls back to regex extraction + OSM. "
-               "The key improves address extraction from messy listing pages and enables the chat assistant.")
-    st.divider()
-    st.subheader("📊 Excel")
-    existing_xlsx = st.file_uploader("Append results to existing Excel", type=["xlsx"])
-    if st.button("🧹 Clear session data"):
-        st.session_state.clear()
-        st.rerun()
+    radius = st.slider("OSM search radius (metres)", 40, 800, 160, 20)
+    existing_xlsx = st.file_uploader("Append to existing Excel", type=["xlsx"])
+    debug = st.toggle("Show debug log", value=True)
+    if st.button("Clear session"):
+        st.session_state.clear(); st.rerun()
 
-# ---- Session state
 if "messages" not in st.session_state:
-    st.session_state.messages = [{
-        "role": "assistant",
-        "content": "G'day! 👋 Paste a property / mall / POI link (realestate.com.au, domain, Zillow, Google Maps place, etc.) "
-                   "or just type an address, and I'll extract the **parent** (lot/site) and **child** (building) polygons with areas. "
-                   "You can also ask me questions about the extracted data.",
-    }]
+    st.session_state.messages = [{"role":"assistant", "content":"Paste a POI/property link or address and I’ll extract parent + child polygons."}]
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
-URL_RE = re.compile(r"https?://\S+")
-ADDR_HINT = re.compile(r"\d+\s+\w+.*(street|st\b|road|rd\b|ave|drive|dr\b|court|ct\b|cres|blvd|lane|ln\b|way|place|pl\b|terrace|tce)", re.I)
-
-# ---- Chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# ---- Chat input
-user_input = st.chat_input("Paste a link or address, or ask about the data…")
+URL_RE = re.compile(r"https?://\S+")
+ADDRESS_RE = re.compile(r"\d+\s+.+\b(street|st\b|road|rd\b|ave|avenue|drive|dr\b|court|ct\b|cres|blvd|lane|ln\b|way|place|pl\b|terrace|tce|highway|hwy)\b", re.I)
+LATLON_RE = re.compile(r"-?\d{1,2}\.\d{4,}\s*,\s*-?\d{1,3}\.\d{4,}")
 
+user_input = st.chat_input("Paste link, address, or lat/lon…")
 if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({"role":"user", "content":user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
-
-    urls = URL_RE.findall(user_input)
-    looks_like_address = bool(ADDR_HINT.search(user_input))
-
     with st.chat_message("assistant"):
-        if urls or looks_like_address:
+        urls = URL_RE.findall(user_input)
+        is_extract = bool(urls or ADDRESS_RE.search(user_input) or LATLON_RE.search(user_input))
+        if is_extract:
             query = urls[0] if urls else user_input.strip()
             with st.status("Extracting polygons…", expanded=True) as progress:
-                res = run_pipeline(query, api_key, model, radius, progress, scraper_key)
-                progress.update(label="Done", state="complete", expanded=False)
-
-            if res["rows"]:
-                df_new = pd.DataFrame(res["rows"])
+                result = run_pipeline(query, api_key, model, radius, progress, scraper_key)
+                progress.update(label="Extraction complete", state="complete", expanded=False)
+            if result["rows"]:
+                df_new = pd.DataFrame(result["rows"])
                 st.session_state.df = pd.concat([st.session_state.df, df_new], ignore_index=True)
-                st.session_state.last_result = res
-
-                n_child = sum(1 for r in res["rows"] if r["polygon_type"] == "CHILD")
-                parent_row = next((r for r in res["rows"] if r["polygon_type"] == "PARENT"), None)
-                reply = f"**Extracted {len(res['rows'])} polygon(s)** for *{res['address']}*\n\n"
-                if parent_row:
-                    reply += f"- 🟦 **Parent** ({parent_row['name']}): {fmt_area(parent_row['area_m2'])}\n"
-                    if parent_row.get("listed_lot_m2"):
-                        diff = 100 * (parent_row["area_m2"] - parent_row["listed_lot_m2"]) / parent_row["listed_lot_m2"]
-                        reply += f"  - Listing states {parent_row['listed_lot_m2']:,.0f} m² ({diff:+.1f}% vs polygon)\n"
-                reply += f"- 🟥 **Children**: {n_child} building footprint(s)\n"
-                if res["fallback_used"]:
-                    reply += "\n> ℹ️ The original link couldn't be fully read, so I cross-referenced "
-                    reply += "(URL slug → address → OpenStreetMap) to recover the data.\n"
-                reply += "\nSee the **table, map and downloads** below 👇"
-                st.markdown(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+                st.session_state.last_result = result
+                parent = df_new[df_new["polygon_type"] == "PARENT"].iloc[0]
+                children = len(df_new[df_new["polygon_type"] == "CHILD"])
+                msg = f"Extracted **{len(df_new)} polygon(s)** for **{result['address']}**.\n\n🟦 Parent: {fmt_area(parent.area_m2)}\n\n🟥 Child buildings: **{children}**"
+                if result["fallback_used"]:
+                    msg += "\n\nNote: fallback mode was used, so parent boundary may be approximate if OSM has no exact site polygon."
+                st.markdown(msg)
+                if debug:
+                    with st.expander("Debug log"):
+                        st.write("\n".join(result["log"]))
+                st.session_state.messages.append({"role":"assistant", "content":msg})
             else:
-                reply = ("I couldn't extract polygons for that one. 😕\n\n" +
-                         "\n".join(f"- {l}" for l in res["log"]) +
-                         "\n\n**Tips:** try pasting the property address directly, or a Google Maps link to the place.")
-                st.markdown(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+                msg = "I could not extract polygons. Try pasting the full street address or a Google Maps link with coordinates."
+                st.error(msg)
+                if debug:
+                    st.write("\n".join(result["log"]))
+                st.session_state.messages.append({"role":"assistant", "content":msg})
         else:
-            # Conversational turn — answer with Gemini using data context
-            ctx = st.session_state.df.to_csv(index=False)[:6000] if not st.session_state.df.empty else "No data extracted yet."
-            answer = gemini_call(
-                f"You are a friendly GIS/POI assistant inside a Streamlit app. Extracted polygon data (CSV):\n{ctx}\n\n"
-                f"User question: {user_input}\nAnswer concisely and helpfully.",
-                api_key, model, temperature=0.6,
-            ) or ("Add a Gemini API key in the sidebar to enable chat answers — "
-                  "or paste a property link/address and I'll extract its polygons.")
+            ctx = st.session_state.df.to_csv(index=False)[:7000] if not st.session_state.df.empty else "No polygon data yet."
+            answer = gemini_call(f"You are a GIS POI assistant. Data:\n{ctx}\n\nQuestion: {user_input}", api_key, model, temperature=0.5) or "Paste a property/POI link or address first. Add a Gemini API key for data Q&A."
             st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.session_state.messages.append({"role":"assistant", "content":answer})
 
-# ----------------------------------------------------------------------------
-# Results section
-# ----------------------------------------------------------------------------
 if not st.session_state.df.empty:
     st.divider()
-    tab_map, tab_table, tab_export = st.tabs(["🗺️ Map", "📋 Data table", "⬇️ Export"])
-
-    with tab_map:
-        if st.session_state.last_result and st.session_state.last_result.get("lat"):
-            st_folium(build_map(st.session_state.last_result), width=None, height=520)
-            st.caption("🟦 dashed = PARENT lot/site · 🟥 solid = CHILD buildings · switch to Satellite in the layer control ↗")
-
-    with tab_table:
-        st.dataframe(
-            st.session_state.df,
-            use_container_width=True,
-            column_config={
-                "area_m2": st.column_config.NumberColumn("Area (m²)", format="%.1f"),
-                "area_sqft": st.column_config.NumberColumn("Area (sqft)", format="%.0f"),
-                "area_acres": st.column_config.NumberColumn("Area (acres)", format="%.4f"),
-            },
-        )
+    tab1, tab2, tab3 = st.tabs(["Map", "Data", "Export"])
+    with tab1:
+        if st.session_state.last_result:
+            st_folium(build_map(st.session_state.last_result), height=560, use_container_width=True)
+    with tab2:
+        st.dataframe(st.session_state.df, use_container_width=True)
+    with tab3:
         c1, c2, c3 = st.columns(3)
-        c1.metric("Total polygons", len(st.session_state.df))
-        c2.metric("Parents", int((st.session_state.df.polygon_type == "PARENT").sum()))
-        c3.metric("Children", int((st.session_state.df.polygon_type == "CHILD").sum()))
-
-    with tab_export:
-        col1, col2, col3 = st.columns(3)
-        col1.download_button(
-            "⬇️ Download CSV",
-            st.session_state.df.to_csv(index=False).encode(),
-            file_name="poi_polygons.csv", mime="text/csv", use_container_width=True,
-        )
-        col2.download_button(
-            "⬇️ Download Excel (new file)",
-            df_to_excel_bytes(st.session_state.df),
-            file_name="poi_polygons.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        c1.download_button("Download CSV", st.session_state.df.to_csv(index=False).encode("utf-8"), "poi_polygons.csv", "text/csv", use_container_width=True)
+        c2.download_button("Download Excel", df_to_excel_bytes(st.session_state.df), "poi_polygons.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         if existing_xlsx is not None:
-            col3.download_button(
-                "⬇️ Download merged Excel (appended)",
-                append_to_existing_excel(existing_xlsx, st.session_state.df),
-                file_name=f"merged_{existing_xlsx.name}",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            c3.download_button("Download merged Excel", append_to_existing_excel(existing_xlsx, st.session_state.df), f"merged_{existing_xlsx.name}", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         else:
-            col3.info("Upload an existing .xlsx in the sidebar to append & merge.")
+            c3.info("Upload an .xlsx in the sidebar to merge.")
 
-st.markdown(
-    "<p style=\"text-align:center;color:#8B97AB;font-family:'JetBrains Mono',monospace;"
-    "font-size:.68rem;letter-spacing:1px;margin-top:28px;\">"
-    "DATA © OPENSTREETMAP · GEOCODING NOMINATIM + PHOTON · POLYGONS OVERPASS · LLM GEMINI FREE TIER</p>",
-    unsafe_allow_html=True,
-)
+st.caption("Data © OpenStreetMap contributors. Geocoding: Nominatim/Photon. Polygons: Overpass API. LLM: optional Gemini API.")
