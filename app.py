@@ -76,29 +76,148 @@ def fmt_area(m2: float) -> str:
 
 
 # ----------------------------------------------------------------------------
-# 1) Page fetching (direct -> Jina reader fallback)
+# 0) Address straight from the URL (no fetching needed — unblockable)
+#    Big portals embed the full address in the URL slug.
 # ----------------------------------------------------------------------------
-def fetch_page_text(url: str) -> tuple[str, str]:
-    """Return (text, method). Tries direct fetch, then r.jina.ai reader."""
-    # Direct
+STREET_WORDS = (r"street|st|road|rd|avenue|ave|drive|dr|court|ct|crescent|cres|boulevard|blvd|"
+                r"lane|ln|way|place|pl|terrace|tce|highway|hwy|parade|pde|circuit|cct|"
+                r"esplanade|esp|circle|cir|trail|trl|parkway|pkwy|square|sq")
+US_STATES = ("AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT "
+             "NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC").split()
+AU_STATES = "NSW VIC QLD WA SA TAS ACT NT".split()
+
+
+def address_from_url(url: str) -> str | None:
+    """Parse the address directly out of well-known portal URL patterns."""
+    from urllib.parse import urlparse, unquote
+    u = urlparse(url.lower())
+    host, path = u.netloc, unquote(u.path)
+
+    def tidy(s: str) -> str:
+        s = s.replace("+", " ").replace("_", " ").replace("-", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    # Zillow: /homedetails/1234-N-Main-St-Phoenix-AZ-85001/12345_zpid/
+    if "zillow." in host:
+        m = re.search(r"/homedetails/([^/]+)/", path)
+        if m:
+            slug = tidy(m.group(1))
+            m2 = re.search(rf"^(.*?)\s({'|'.join(s.lower() for s in US_STATES)})\s(\d{{5}})$", slug)
+            if m2:
+                return f"{m2.group(1)}, {m2.group(2).upper()} {m2.group(3)}, USA"
+            return slug + ", USA"
+
+    # Redfin: /AZ/Phoenix/1234-N-Main-St-85001/home/123456
+    if "redfin." in host:
+        m = re.search(r"/([a-z]{2})/([^/]+)/([^/]+)/home/", path)
+        if m:
+            state, city, street = m.group(1).upper(), tidy(m.group(2)), tidy(m.group(3))
+            street = re.sub(r"\s\d{5}$", "", street)
+            return f"{street}, {city}, {state}, USA"
+
+    # Realtor.com: /realestateandhomes-detail/1234-Main-St_Phoenix_AZ_85001_M123-456
+    if "realtor.com" in host:
+        m = re.search(r"/realestateandhomes-detail/([^/]+)", path)
+        if m:
+            parts = m.group(1).split("_")
+            parts = [p for p in parts if not re.match(r"^m\d", p)]
+            return tidy(", ".join(parts)) + ", USA"
+
+    # Trulia: /p/az/phoenix/1234-n-main-st-phoenix-az-85001--123456
+    if "trulia." in host:
+        m = re.search(r"/p/[a-z]{2}/[^/]+/([^/]+?)(?:--\d+)?/?$", path)
+        if m:
+            return tidy(m.group(1)) + ", USA"
+
+    # Domain.com.au: /12-smith-street-darwin-city-nt-0800-2019001234
+    if "domain.com.au" in host:
+        m = re.search(r"/(\d+[a-z]?(?:-[\w']+)+?-(?:%s)-[\w-]+?-(?:%s)-\d{4})" %
+                      (STREET_WORDS, "|".join(s.lower() for s in AU_STATES)), path)
+        if m:
+            return tidy(m.group(1)) + ", Australia"
+        m = re.search(r"/([\w'+-]+)-(\d{4})-\d{6,}", path)  # suburb-postcode-id
+        if m:
+            return f"{tidy(m.group(1))} {m.group(2)}, Australia"
+
+    # realestate.com.au: /property/12-smith-st-darwin-city-nt-0800/  OR
+    #                    /property-house-nt-darwin+city-141234567
+    if "realestate.com" in host:
+        m = re.search(r"/property/([\w'+-]+?)/?$", path)
+        if m and re.match(r"^\d", m.group(1)):
+            return tidy(m.group(1)) + ", Australia"
+        m = re.search(r"/property-[\w]+-(%s)-([\w'+]+)-\d{6,}" %
+                      "|".join(s.lower() for s in AU_STATES), path)
+        if m:
+            return f"{tidy(m.group(2))}, {m.group(1).upper()}, Australia"
+
+    # Generic: number-street-words-...-(state)-(zip/postcode) anywhere in path
+    m = re.search(rf"(\d+[a-z]?(?:-[\w']+){{1,6}}-(?:{STREET_WORDS})(?:-[\w']+){{0,5}})", path)
+    if m:
+        addr = tidy(m.group(1))
+        tail = re.search(rf"\b({'|'.join(s.lower() for s in US_STATES + AU_STATES)})[-/](\d{{4,5}})\b", path)
+        if tail:
+            addr += f", {tail.group(1).upper()} {tail.group(2)}"
+        return addr
+    return None
+
+
+# ----------------------------------------------------------------------------
+# 1) Page fetching (direct -> Jina reader -> CORS proxy -> ScraperAPI)
+# ----------------------------------------------------------------------------
+def fetch_page_text(url: str, scraper_key: str = "") -> tuple[str, str]:
+    """Return (text, method). Cascades through free fetch strategies."""
+
+    def strip_html(html: str) -> str:
+        t = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+        t = re.sub(r"<style.*?</style>", " ", t, flags=re.S | re.I)
+        t = re.sub(r"<[^>]+>", " ", t)
+        return re.sub(r"\s+", " ", t)
+
+    # 1. Direct with realistic browser headers
     try:
-        r = requests.get(url, headers=UA, timeout=15)
+        r = requests.get(url, headers={**UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.google.com/", "DNT": "1",
+            "Upgrade-Insecure-Requests": "1"}, timeout=15)
         if r.status_code == 200 and len(r.text) > 500:
-            txt = re.sub(r"<script.*?</script>", " ", r.text, flags=re.S | re.I)
-            txt = re.sub(r"<style.*?</style>", " ", txt, flags=re.S | re.I)
-            txt = re.sub(r"<[^>]+>", " ", txt)
-            txt = re.sub(r"\s+", " ", txt)
-            if len(txt) > 400:
+            txt = strip_html(r.text)
+            if len(txt) > 400 and "captcha" not in txt[:2000].lower():
                 return txt[:18000], "direct"
     except Exception:
         pass
-    # Jina AI reader (free, renders JS, bypasses many blocks)
+
+    # 2. Jina AI reader (free, renders JS)
     try:
-        r = requests.get(f"https://r.jina.ai/{url}", headers=UA, timeout=25)
-        if r.status_code == 200 and len(r.text) > 200:
+        r = requests.get(f"https://r.jina.ai/{url}",
+                         headers={**UA, "X-Return-Format": "text"}, timeout=25)
+        if r.status_code == 200 and len(r.text) > 300 and "captcha" not in r.text[:2000].lower():
             return r.text[:18000], "jina-reader"
     except Exception:
         pass
+
+    # 3. AllOrigins CORS proxy (free)
+    try:
+        r = requests.get("https://api.allorigins.win/raw",
+                         params={"url": url}, headers=UA, timeout=25)
+        if r.status_code == 200 and len(r.text) > 500:
+            txt = strip_html(r.text)
+            if len(txt) > 400:
+                return txt[:18000], "allorigins-proxy"
+    except Exception:
+        pass
+
+    # 4. ScraperAPI (optional user key — free tier 1000 req/mo, handles JS + blocks)
+    if scraper_key:
+        try:
+            r = requests.get("https://api.scraperapi.com/",
+                             params={"api_key": scraper_key, "url": url, "render": "true"},
+                             timeout=60)
+            if r.status_code == 200 and len(r.text) > 500:
+                return strip_html(r.text)[:18000], "scraperapi"
+        except Exception:
+            pass
+
     return "", "failed"
 
 
@@ -357,7 +476,7 @@ def fetch_osm_polygons(lat: float, lon: float, radius: int = 120) -> dict:
 # ----------------------------------------------------------------------------
 # 5) Full pipeline for one URL / address
 # ----------------------------------------------------------------------------
-def run_pipeline(query: str, api_key: str, model: str, radius: int, progress) -> dict:
+def run_pipeline(query: str, api_key: str, model: str, radius: int, progress, scraper_key: str = "") -> dict:
     result = {
         "source": query, "address": None, "lat": None, "lon": None,
         "listing": {}, "rows": [], "geojson_parent": [], "geojson_children": [],
@@ -367,14 +486,26 @@ def run_pipeline(query: str, api_key: str, model: str, radius: int, progress) ->
     listing = {}
 
     if is_url:
+        # 0) Address straight from the URL — instant, cannot be blocked
+        url_addr = address_from_url(query)
+        if url_addr:
+            listing["address"] = url_addr
+            result["log"].append(f"Address parsed from URL slug: '{url_addr}' (no scraping needed)")
+
+        # 1) Fetch page for enrichment (lot size, price…) — optional if we have the address
         progress.write("🌐 Fetching page…")
-        text, method = fetch_page_text(query)
+        text, method = fetch_page_text(query, scraper_key)
         result["log"].append(f"Page fetch: {method}")
         if text:
             progress.write(f"🤖 Extracting listing data ({'Gemini' if api_key else 'regex'})…")
-            listing = llm_extract_listing(text, query, api_key, model)
-        else:
-            result["log"].append("Direct link unreadable — falling back to cross-reference.")
+            extracted = llm_extract_listing(text, query, api_key, model)
+            # keep URL-parsed address unless page gives a more complete one
+            if url_addr and (not extracted.get("address") or len(str(extracted.get("address"))) < len(url_addr)):
+                extracted["address"] = url_addr
+            listing = {**listing, **{k: v for k, v in extracted.items() if v}}
+        elif url_addr:
+            result["log"].append("Page blocked — proceeding with URL-parsed address + OSM polygons (cross-reference mode).")
+            result["fallback_used"] = True
         # Cross-reference fallback: derive a search query from the URL slug
         if not listing.get("address"):
             slug = re.sub(r"https?://[^/]+/", "", query)
@@ -667,6 +798,8 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = st.text_input("Gemini API key (free — aistudio.google.com)", type="password")
+    scraper_key = st.text_input("ScraperAPI key (optional — scraperapi.com free tier)", type="password",
+                                help="Only needed if a portal blocks all free fetch methods. 1,000 free requests/month.")
     model = st.selectbox("Gemini model", ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"])
     radius = st.slider("Search radius around POI (m)", 40, 500, 120, 20)
     st.caption("No key? The app still works — it falls back to regex extraction + OSM. "
@@ -714,7 +847,7 @@ if user_input:
         if urls or looks_like_address:
             query = urls[0] if urls else user_input.strip()
             with st.status("Extracting polygons…", expanded=True) as progress:
-                res = run_pipeline(query, api_key, model, radius, progress)
+                res = run_pipeline(query, api_key, model, radius, progress, scraper_key)
                 progress.update(label="Done", state="complete", expanded=False)
 
             if res["rows"]:
