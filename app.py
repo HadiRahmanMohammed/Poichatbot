@@ -149,7 +149,7 @@ def regex_extract(text: str) -> dict:
 def llm_extract_listing(text: str, url: str, api_key: str, model: str) -> dict:
     prompt = f"""You are a real-estate data extractor. From the page text below (source: {url}),
 extract and return ONLY a JSON object (no markdown, no backticks) with keys:
-  "address": full street address as a single string (or null),
+  "address": FULL geocodable street address as one string — must include suburb/city, state and country; infer the country from the website domain if needed (or null),
   "property_type": e.g. house, apartment, mall, land, commercial (or null),
   "lot_size_m2": land/lot size converted to square metres as a number (or null),
   "building_size_m2": building/floor size in square metres as a number (or null),
@@ -177,14 +177,24 @@ PAGE TEXT:
 # ----------------------------------------------------------------------------
 # 3) Geocoding (Nominatim, returns polygon when available)
 # ----------------------------------------------------------------------------
-def geocode(query: str) -> dict | None:
+def clean_address(addr: str) -> str:
+    """Strip listing noise Nominatim chokes on: units, lots, prices, marketing text."""
+    a = addr.strip()
+    a = re.sub(r"(?i)\b(?:unit|apt|apartment|suite|shop|level)\s*\d+\w?\s*[,/]?\s*", "", a)
+    a = re.sub(r"(?i)\blot\s*\d+\w?\s*[,/]?\s*", "", a)
+    a = re.sub(r"^\d+\w?/(\d)", r"\1", a)          # "2/45 Smith St" -> "45 Smith St"
+    a = re.sub(r"(?i)\$[\d,\.]+[km]?", "", a)       # prices
+    a = re.sub(r"(?i)\b(for sale|for rent|sold|auction|offers?)\b.*", "", a)
+    a = re.sub(r"\s+", " ", a).strip(" ,-|·")
+    return a
+
+
+def _nominatim(q: str) -> dict | None:
     try:
         r = requests.get(
             f"{NOMINATIM}/search",
-            params={
-                "q": query, "format": "json", "limit": 1,
-                "polygon_geojson": 1, "addressdetails": 1,
-            },
+            params={"q": q, "format": "json", "limit": 1,
+                    "polygon_geojson": 1, "addressdetails": 1},
             headers=UA, timeout=20,
         )
         res = r.json()
@@ -192,6 +202,82 @@ def geocode(query: str) -> dict | None:
             return res[0]
     except Exception:
         pass
+    return None
+
+
+def _photon(q: str) -> dict | None:
+    """Free komoot Photon geocoder — much more forgiving than Nominatim."""
+    try:
+        r = requests.get("https://photon.komoot.io/api/",
+                         params={"q": q, "limit": 1}, headers=UA, timeout=20)
+        feats = r.json().get("features", [])
+        if feats:
+            f = feats[0]
+            lon, lat = f["geometry"]["coordinates"]
+            props = f.get("properties", {})
+            label = ", ".join(str(props[k]) for k in
+                              ("name", "street", "housenumber", "city", "state", "country")
+                              if props.get(k))
+            return {"lat": lat, "lon": lon, "display_name": label or q, "geojson": None}
+    except Exception:
+        pass
+    return None
+
+
+def geocode(query: str, api_key: str = "", model: str = "gemini-2.0-flash",
+            log: list | None = None) -> dict | None:
+    """Multi-strategy geocoding cascade. Logs every attempt if a log list is given."""
+    def _log(msg):
+        if log is not None:
+            log.append(msg)
+
+    candidates = [query]
+    cleaned = clean_address(query)
+    if cleaned and cleaned != query:
+        candidates.append(cleaned)
+    # street + locality only (drop leading descriptors)
+    m = re.search(r"\d+\w?\s+[\w' \-]+?(?:St|Street|Rd|Road|Ave|Avenue|Dr|Drive|Ct|Court|"
+                  r"Cres|Crescent|Blvd|Boulevard|Ln|Lane|Way|Pl|Place|Tce|Terrace|Hwy|Highway|"
+                  r"Pde|Parade|Cct|Circuit|Esp|Esplanade)\b.*", cleaned or query, re.I)
+    if m:
+        candidates.append(m.group(0))
+    # locality-level last resort: last 2-3 comma parts
+    parts = [p.strip() for p in (cleaned or query).split(",") if p.strip()]
+    if len(parts) >= 2:
+        candidates.append(", ".join(parts[-3:]))
+
+    seen = set()
+    for cand in candidates:
+        if not cand or cand.lower() in seen:
+            continue
+        seen.add(cand.lower())
+        _log(f"Geocode try (Nominatim): '{cand}'")
+        res = _nominatim(cand)
+        if res:
+            _log("  ↳ ✅ hit")
+            return res
+        time.sleep(1.1)  # Nominatim rate policy
+        _log(f"Geocode try (Photon): '{cand}'")
+        res = _photon(cand)
+        if res:
+            _log("  ↳ ✅ hit (Photon)")
+            return res
+
+    # Final resort: ask the LLM to normalise the address, retry both geocoders
+    if api_key:
+        norm = gemini_call(
+            f"Reformat this into a clean geocodable address in the form "
+            f"'house_number street, suburb, state, country' — output ONLY the address, "
+            f"nothing else. If a country is missing, infer it: '{query}'",
+            api_key, model,
+        ).strip()
+        if norm and norm.lower() not in seen and len(norm) < 140:
+            _log(f"Geocode try (LLM-normalised): '{norm}'")
+            res = _nominatim(norm) or _photon(norm)
+            if res:
+                _log("  ↳ ✅ hit")
+                return res
+    _log("  ↳ ❌ all geocoding strategies failed")
     return None
 
 
@@ -318,12 +404,11 @@ def run_pipeline(query: str, api_key: str, model: str, radius: int, progress) ->
         result["log"].append("❌ Could not determine an address from this link.")
         return result
 
+    result["log"].append(f"Address extracted: '{addr}'")
     progress.write(f"📍 Geocoding: {addr}")
-    geo = geocode(addr)
+    geo = geocode(addr, api_key, model, log=result["log"])
     if not geo:
-        geo = geocode(re.sub(r"^[^,]+,\s*", "", addr))  # retry without unit/street no.
-    if not geo:
-        result["log"].append("❌ Geocoding failed.")
+        result["log"].append("❌ Geocoding failed on all strategies.")
         return result
 
     lat, lon = float(geo["lat"]), float(geo["lon"])
@@ -404,6 +489,7 @@ def run_pipeline(query: str, api_key: str, model: str, radius: int, progress) ->
 # ----------------------------------------------------------------------------
 def build_map(res: dict) -> folium.Map:
     m = folium.Map(location=[res["lat"], res["lon"]], zoom_start=18, tiles=None)
+    folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
     folium.TileLayer("OpenStreetMap", name="Street").add_to(m)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -412,14 +498,16 @@ def build_map(res: dict) -> folium.Map:
     for gj in res["geojson_parent"]:
         folium.GeoJson(
             gj, name="Parent polygon",
-            style_function=lambda x: {"color": "#1f6feb", "weight": 3, "fillColor": "#1f6feb", "fillOpacity": 0.10},
-            tooltip="PARENT (lot / site)",
+            style_function=lambda x: {"color": "#4A9EFF", "weight": 3, "dashArray": "7 5",
+                                      "fillColor": "#4A9EFF", "fillOpacity": 0.08},
+            tooltip="PARENT · lot / site",
         ).add_to(m)
     for gj in res["geojson_children"]:
         folium.GeoJson(
             gj, name="Child polygon",
-            style_function=lambda x: {"color": "#d1242f", "weight": 2, "fillColor": "#d1242f", "fillOpacity": 0.30},
-            tooltip="CHILD (building)",
+            style_function=lambda x: {"color": "#FF5D5D", "weight": 2,
+                                      "fillColor": "#FF5D5D", "fillOpacity": 0.30},
+            tooltip="CHILD · building",
         ).add_to(m)
     folium.Marker([res["lat"], res["lon"]], tooltip=res["address"]).add_to(m)
     folium.LayerControl().add_to(m)
@@ -450,12 +538,126 @@ def append_to_existing_excel(upload, df_new: pd.DataFrame) -> bytes:
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="POI Polygon Extractor", page_icon="🗺️", layout="wide")
 
+# ---------------------------------------------------------------------------
+# Design system — "Night Cartography"
+#   ink navy canvas · survey-grid texture · UI accents = polygon legend colors
+#   PARENT #4A9EFF (blue) · CHILD #FF5D5D (coral) · Space Grotesk + JetBrains Mono
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root{
+  --ink:#0B1220; --panel:#131C2E; --panel-2:#182338; --line:#233450;
+  --text:#E8EDF5; --muted:#8B97AB;
+  --parent:#4A9EFF; --child:#FF5D5D; --ok:#3DDC97; --warn:#FFB454;
+}
+
+html, body, [class*="css"], .stApp { font-family:'Space Grotesk',sans-serif; }
+.stApp { background:
+  linear-gradient(rgba(74,158,255,0.035) 1px, transparent 1px),
+  linear-gradient(90deg, rgba(74,158,255,0.035) 1px, transparent 1px),
+  var(--ink);
+  background-size: 42px 42px, 42px 42px, auto; }
+
+/* ---------- hero ---------- */
+.hero{ position:relative; overflow:hidden; border:1px solid var(--line);
+  border-radius:16px; padding:26px 30px 22px;
+  background:linear-gradient(135deg,#0E1A30 0%,#101C33 55%,#13233E 100%); }
+.hero::after{ content:""; position:absolute; inset:0; pointer-events:none;
+  background-image:
+    linear-gradient(rgba(74,158,255,.07) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(74,158,255,.07) 1px,transparent 1px);
+  background-size:34px 34px; }
+.hero h1{ margin:0; font-size:1.75rem; font-weight:700; letter-spacing:.3px; color:var(--text); }
+.hero h1 .mode{ font-family:'JetBrains Mono',monospace; font-size:.5em; color:var(--parent);
+  border:1px solid var(--parent); border-radius:6px; padding:2px 8px; vertical-align:middle;
+  margin-left:10px; letter-spacing:1px; }
+.hero p{ margin:8px 0 0; color:var(--muted); max-width:720px; }
+.hero .coords{ position:absolute; top:14px; right:20px; font-family:'JetBrains Mono',monospace;
+  font-size:.68rem; color:var(--muted); letter-spacing:1px; opacity:.8; }
+.hero svg{ position:absolute; right:26px; bottom:-6px; opacity:.9; }
+.legend{ display:flex; gap:18px; margin-top:14px; font-family:'JetBrains Mono',monospace; font-size:.72rem; }
+.legend span{ display:inline-flex; align-items:center; gap:7px; color:var(--muted); letter-spacing:.5px;}
+.swatch{ width:12px; height:12px; border-radius:3px; display:inline-block; }
+.swatch.p{ background:rgba(74,158,255,.25); border:2px solid var(--parent); }
+.swatch.c{ background:rgba(255,93,93,.35); border:2px solid var(--child); }
+
+/* ---------- chat ---------- */
+[data-testid="stChatMessage"]{ background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; padding:14px 16px; }
+[data-testid="stChatMessage"]:has([aria-label="Chat message from user"]),
+[data-testid="stChatMessage"][data-testid*="user"]{ background:var(--panel-2); }
+[data-testid="stChatInput"] textarea{ font-family:'Space Grotesk',sans-serif !important; }
+[data-testid="stChatInput"]{ border:1px solid var(--line); border-radius:14px; }
+[data-testid="stChatInput"]:focus-within{ border-color:var(--parent);
+  box-shadow:0 0 0 3px rgba(74,158,255,.18); }
+
+/* ---------- sidebar ---------- */
+[data-testid="stSidebar"]{ background:linear-gradient(180deg,#0D1626,#0B1220);
+  border-right:1px solid var(--line); }
+[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{
+  font-size:.8rem; text-transform:uppercase; letter-spacing:2px; color:var(--muted);
+  font-family:'JetBrains Mono',monospace; }
+
+/* ---------- tabs ---------- */
+.stTabs [data-baseweb="tab-list"]{ gap:6px; border-bottom:1px solid var(--line); }
+.stTabs [data-baseweb="tab"]{ font-family:'JetBrains Mono',monospace; font-size:.8rem;
+  letter-spacing:1px; border-radius:10px 10px 0 0; padding:8px 18px; color:var(--muted); }
+.stTabs [aria-selected="true"]{ color:var(--parent) !important;
+  background:rgba(74,158,255,.08); border-bottom:2px solid var(--parent); }
+
+/* ---------- metrics as legend cards ---------- */
+[data-testid="stMetric"]{ background:var(--panel); border:1px solid var(--line);
+  border-radius:14px; padding:14px 18px; }
+[data-testid="stMetric"] [data-testid="stMetricLabel"]{ font-family:'JetBrains Mono',monospace;
+  font-size:.68rem; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted); }
+[data-testid="stMetric"] [data-testid="stMetricValue"]{ font-family:'JetBrains Mono',monospace; }
+div[data-testid="column"]:nth-of-type(2) [data-testid="stMetricValue"]{ color:var(--parent); }
+div[data-testid="column"]:nth-of-type(3) [data-testid="stMetricValue"]{ color:var(--child); }
+
+/* ---------- buttons ---------- */
+.stDownloadButton button, .stButton button{
+  border:1px solid var(--line); border-radius:12px; background:var(--panel-2);
+  color:var(--text); font-family:'JetBrains Mono',monospace; font-size:.78rem;
+  letter-spacing:.5px; transition:all .15s ease; }
+.stDownloadButton button:hover, .stButton button:hover{
+  border-color:var(--parent); color:var(--parent);
+  box-shadow:0 0 0 3px rgba(74,158,255,.15); transform:translateY(-1px); }
+
+/* ---------- dataframe / status / misc ---------- */
+[data-testid="stDataFrame"]{ border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+[data-testid="stStatus"]{ background:var(--panel); border:1px solid var(--line); border-radius:14px; }
+[data-testid="stFileUploader"]{ border:1px dashed var(--line); border-radius:14px; padding:6px; }
+hr{ border-color:var(--line) !important; }
+code, .mono{ font-family:'JetBrains Mono',monospace; }
+::-webkit-scrollbar{ width:9px; height:9px; }
+::-webkit-scrollbar-thumb{ background:var(--line); border-radius:6px; }
+::-webkit-scrollbar-thumb:hover{ background:var(--parent); }
+@media (prefers-reduced-motion: reduce){ *{ transition:none !important; animation:none !important; } }
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown(
     """
-    <div style="padding:14px 18px;border-radius:12px;
-         background:linear-gradient(90deg,#0f2027,#203a43,#2c5364);color:white;">
-      <h2 style="margin:0;">🗺️ POI Polygon Extractor <span style="font-size:0.55em;opacity:.7;">expert mode</span></h2>
-      <p style="margin:4px 0 0;opacity:.85;">Paste a real-estate / mall / POI link → get parent & child polygon areas, map, and Excel export.</p>
+    <div class="hero">
+      <div class="coords">LAT −12.4634 · LON 130.8456 · WGS84</div>
+      <h1>🗺️ POI Polygon Extractor <span class="mode">EXPERT&nbsp;MODE</span></h1>
+      <p>Paste a real-estate / mall / POI link — I'll trace the site boundary and every building
+         footprint inside it, measure true geodesic areas, and export to Excel.</p>
+      <div class="legend">
+        <span><i class="swatch p"></i>PARENT · LOT / SITE</span>
+        <span><i class="swatch c"></i>CHILD · BUILDING</span>
+      </div>
+      <svg width="150" height="86" viewBox="0 0 150 86" fill="none">
+        <polygon points="8,78 22,14 118,6 142,60 96,82" stroke="#4A9EFF" stroke-width="2"
+                 stroke-dasharray="7 5" fill="rgba(74,158,255,0.07)"/>
+        <polygon points="46,50 58,26 100,24 108,52 78,62" stroke="#FF5D5D" stroke-width="2"
+                 fill="rgba(255,93,93,0.16)"/>
+        <circle cx="22" cy="14" r="3.5" fill="#4A9EFF"/><circle cx="142" cy="60" r="3.5" fill="#4A9EFF"/>
+        <circle cx="8" cy="78" r="3.5" fill="#4A9EFF"/><circle cx="118" cy="6" r="3.5" fill="#4A9EFF"/>
+        <circle cx="96" cy="82" r="3.5" fill="#4A9EFF"/>
+      </svg>
     </div>
     """,
     unsafe_allow_html=True,
@@ -563,7 +765,7 @@ if not st.session_state.df.empty:
     with tab_map:
         if st.session_state.last_result and st.session_state.last_result.get("lat"):
             st_folium(build_map(st.session_state.last_result), width=None, height=520)
-            st.caption("🟦 Parent = lot / site polygon 🟥 Red = child building footprints. Toggle satellite in the layer control.")
+            st.caption("🟦 dashed = PARENT lot/site · 🟥 solid = CHILD buildings · switch to Satellite in the layer control ↗")
 
     with tab_table:
         st.dataframe(
@@ -606,7 +808,8 @@ if not st.session_state.df.empty:
             col3.info("Upload an existing .xlsx in the sidebar to append & merge.")
 
 st.markdown(
-    "<p style='text-align:center;opacity:.5;font-size:.8em;margin-top:24px;'>"
-    "Data © OpenStreetMap contributors · Geocoding: Nominatim · Polygons: Overpass API · LLM: Google Gemini (free tier)</p>",
+    "<p style=\"text-align:center;color:#8B97AB;font-family:'JetBrains Mono',monospace;"
+    "font-size:.68rem;letter-spacing:1px;margin-top:28px;\">"
+    "DATA © OPENSTREETMAP · GEOCODING NOMINATIM + PHOTON · POLYGONS OVERPASS · LLM GEMINI FREE TIER</p>",
     unsafe_allow_html=True,
 )
